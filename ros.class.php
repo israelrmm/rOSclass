@@ -12,7 +12,7 @@ class RouterosAPI
     public bool $connected  = false;
     public int $port        = 8728;
     public bool $ssl        = false;
-    public int $timeout     = 225;
+    public int $timeout     = 25;
     public int $attempts    = 3;
     public int $delay       = 2;
 
