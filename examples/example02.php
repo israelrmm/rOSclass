@@ -1,5 +1,5 @@
 <?php
-require_once('ros.class.php');
+require_once('../ros.class.php');
 
 // 1. Instantiate the class
 $API = new RouterosAPI();
