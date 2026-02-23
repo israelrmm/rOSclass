@@ -23,7 +23,7 @@ Simply download the `ros.class.php` file and include it in your project:
 
 ```php
 require_once 'ros.class.php';
-
+```
 
 # rOSclass
 A modern, lightweight PHP class optimized for the RouterOS/Mikrotik native API
