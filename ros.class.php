@@ -2,7 +2,8 @@
 /*****************************
  * RouterOS PHP API class ( JAN 2026)
  * For php 7.0+
- * Israel Marrero
+ * Based in work of https://github.com/BenMenking/routeros-api
+ * by Israel Marrero
  ***********************************************/
 
 class RouterosAPI
