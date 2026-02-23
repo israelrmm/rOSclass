@@ -11,7 +11,7 @@ if ($API->connect('192.168.88.1', 'admin', 'your_password')) {
     // The RouterOS path is: /system/identity/set
     // The property we want to change is 'name'
     $newIdentity = [
-        'name' => 'ChangedIdentityRouter'
+        'name' => 'RosClassRouter'
     ];
 
     // 4. Execute using the comm method
