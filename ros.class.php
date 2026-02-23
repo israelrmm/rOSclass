@@ -1,8 +1,8 @@
 <?php
 /*****************************
- * RouterOS PHP API class (Versión optimized JAN 2026)
+ * RouterOS PHP API class ( JAN 2026)
  * For php 7.0+
- * Based on Denis Basta works, By Israel Marrero
+ * Israel Marrero
  ***********************************************/
 
 class RouterosAPI
