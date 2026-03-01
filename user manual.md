@@ -141,4 +141,3 @@ if (\!$api-\>connect('10.0.0.1', 'admin', 'pass')) {
 2. **Sanitize Inputs**: If you are taking user input from a web form to update the router, ensure you validate the data before passing it to comm().  
 3. **Use comm over execmd**: The comm method is more robust as it handles parameter escaping and structure better than a single string.
 
-**Would you like me to generate a specific implementation example, such as a script to manage PPPoE users or Hotspot vouchers?**
