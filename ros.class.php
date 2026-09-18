@@ -1,6 +1,6 @@
 <?php
 /*****************************
- * RouterOS PHP API class ( JAN 2026)
+ * RouterOS PHP API class ( sep 2026)
  * For php 7.0+
  * Based in work of https://github.com/BenMenking/routeros-api
  * by Israel Marrero
@@ -11,13 +11,21 @@ class RouterosAPI
     // Propiedades con tipos definidos (PHP 7.4+)
     public bool $debug      = false;
     public bool $connected  = false;
-    public int $port        = 8728;
+    public int  $port       = 8728;
     public bool $ssl        = false;
-    public int $timeout     = 25;
-    public int $attempts    = 3;
-    public int $delay       = 2;
+    public int  $timeout    = 225;
+    public int  $attempts   = 3;
+    public int  $delay      = 2;
 
+    /** Tamaño del bloque de lectura del socket (bytes). */
+    public int $readChunkSize = 8192;
+
+    /** @var resource|null */
     protected $socket;
+
+    /** Buffer interno para evitar fread() byte a byte. */
+    protected string $readBuffer = '';
+
     public $error_no;
     public $error_str;
 
@@ -48,21 +56,59 @@ class RouterosAPI
         return chr(0xF0) . chr(($length >> 24) & 0xFF) . chr(($length >> 16) & 0xFF) . chr(($length >> 8) & 0xFF) . chr($length & 0xFF);
     }
 
+    /* ---------------------------------------------------------------------
+     *  Buffer de lectura — la gran optimización
+     * ------------------------------------------------------------------- */
+
     /**
-     * Establece la conexión y realiza el login.
+     * Devuelve exactamente $n bytes (o menos si el socket cierra/timeout).
+     * Lee del socket en bloques grandes y mantiene un buffer interno.
      */
+    protected function readBytes(int $n): string
+    {
+        if ($n <= 0) return '';
+
+        $buffered = strlen($this->readBuffer);
+        while ($buffered < $n) {
+            $need  = $n - $buffered;
+            $chunk = fread($this->socket, max($this->readChunkSize, $need));
+            if ($chunk === false || $chunk === '') {
+                break; // timeout o desconexión
+            }
+            $this->readBuffer .= $chunk;
+            $buffered += strlen($chunk);
+        }
+
+        if ($buffered === 0) return '';
+
+        if ($buffered <= $n) {
+            $data = $this->readBuffer;
+            $this->readBuffer = '';
+            return $data;
+        }
+
+        $data = substr($this->readBuffer, 0, $n);
+        $this->readBuffer = substr($this->readBuffer, $n);
+        return $data;
+    }
+
+    /* ---------------------------------------------------------------------
+     *  Conexión
+     * ------------------------------------------------------------------- */
     public function connect(string $ip, string $login, string $password): bool
     {
         for ($a = 1; $a <= $this->attempts; $a++) {
-            $this->connected = false;
+            $this->connected  = false;
+            $this->readBuffer = '';
+
             $protocol = ($this->ssl ? 'ssl://' : 'tcp://');
 
             $context = stream_context_create([
                 'ssl' => [
-                    'verify_peer' => false,
-                    'verify_peer_name' => false,
-                    'allow_self_signed' => true
-                ]
+                    'verify_peer'       => false,
+                    'verify_peer_name'  => false,
+                    'allow_self_signed' => true,
+                ],
             ]);
 
             $this->socket = @stream_socket_client(
@@ -76,6 +122,16 @@ class RouterosAPI
 
             if (is_resource($this->socket)) {
                 stream_set_timeout($this->socket, $this->timeout);
+
+                // Desactivar Nagle (TCP_NODELAY): elimina el retardo de ~40 ms
+                // por comando. Es opcional: si la extensión sockets no existe
+                // simplemente se ignora.
+                if (function_exists('socket_import_stream')) {
+                    $sock = @socket_import_stream($this->socket);
+                    if ($sock !== false && defined('TCP_NODELAY')) {
+                        @socket_set_option($sock, SOL_TCP, TCP_NODELAY, 1);
+                    }
+                }
 
                 if ($this->loginProcess($login, $password)) {
                     $this->connected = true;
@@ -106,17 +162,16 @@ class RouterosAPI
 
         $response = $this->read(false);
 
-        if (isset($response[0]) && $response[0] == '!done') {
+        if (($response[0] ?? null) === '!done') {
             if (!isset($response[1])) {
                 return true;
-            } else {
-                if (preg_match('/ret=([0-9a-f]{32})/', $response[1], $matches)) {
-                    $this->write('/login', false);
-                    $this->write('=name=' . $login, false);
-                    $this->write('=response=00' . md5(chr(0) . $password . pack('H*', $matches[1])));
-                    $response = $this->read(false);
-                    return (isset($response[0]) && $response[0] == '!done');
-                }
+            }
+            if (preg_match('/ret=([0-9a-f]{32})/', $response[1], $matches)) {
+                $this->write('/login', false);
+                $this->write('=name=' . $login, false);
+                $this->write('=response=00' . md5(chr(0) . $password . pack('H*', $matches[1])));
+                $response = $this->read(false);
+                return (($response[0] ?? null) === '!done');
             }
         }
         return false;
@@ -127,26 +182,36 @@ class RouterosAPI
         if (is_resource($this->socket)) {
             fclose($this->socket);
         }
-        $this->connected = false;
+        $this->connected  = false;
+        $this->readBuffer = '';
     }
 
+    /* ---------------------------------------------------------------------
+     *  Escritura
+     * ------------------------------------------------------------------- */
+
     /**
-     * Escribe palabras en el socket siguiendo el protocolo de longitud + palabra.
+     * Escribe longitud + palabra (+ terminador si $terminal).
+     * Se hace todo en un solo fwrite → 1 syscall en lugar de 2.
      */
     public function write(string $command, bool $terminal = true): bool
     {
         if (!is_resource($this->socket)) return false;
 
         $command = trim($command);
-        fwrite($this->socket, $this->encodeLength(strlen($command)) . $command);
-        $this->debug("<<< $command");
-
+        $data = $this->encodeLength(strlen($command)) . $command;
         if ($terminal) {
-            fwrite($this->socket, chr(0));
+            $data .= chr(0);
         }
 
+        fwrite($this->socket, $data);
+        $this->debug("<<< $command");
         return true;
     }
+
+    /* ---------------------------------------------------------------------
+     *  Lectura
+     * ------------------------------------------------------------------- */
 
     /**
      * Lee la respuesta del RouterOS.
@@ -154,34 +219,49 @@ class RouterosAPI
     public function read(bool $parse = true)
     {
         $responses = [];
+
         while (is_resource($this->socket)) {
-            $byteStr = fread($this->socket, 1);
-            if ($byteStr === false || $byteStr === "") break;
+            $byteStr = $this->readBytes(1);
+            if ($byteStr === '') break;
 
             $byte = ord($byteStr);
-            $length = 0;
 
+            // Decodificar longitud (protocolo MikroTik)
             if ($byte & 128) {
-                if (($byte & 192) == 128) $length = (($byte & 63) << 8) + ord(fread($this->socket, 1));
-                elseif (($byte & 224) == 192) $length = (($byte & 31) << 16) + (ord(fread($this->socket, 1)) << 8) + ord(fread($this->socket, 1));
-                elseif (($byte & 240) == 224) $length = (($byte & 15) << 24) + (ord(fread($this->socket, 1)) << 16) + (ord(fread($this->socket, 1)) << 8) + ord(fread($this->socket, 1));
-                else $length = (ord(fread($this->socket, 1)) << 24) + (ord(fread($this->socket, 1)) << 16) + (ord(fread($this->socket, 1)) << 8) + ord(fread($this->socket, 1));
+                if (($byte & 192) === 128) {
+                    $length = (($byte & 63) << 8) | ord($this->readBytes(1));
+                } elseif (($byte & 224) === 192) {
+                    $length = (($byte & 31) << 16)
+                            | (ord($this->readBytes(1)) << 8)
+                            |  ord($this->readBytes(1));
+                } elseif (($byte & 240) === 224) {
+                    $length = (($byte & 15) << 24)
+                            | (ord($this->readBytes(1)) << 16)
+                            | (ord($this->readBytes(1)) << 8)
+                            |  ord($this->readBytes(1));
+                } else {
+                    $length = (ord($this->readBytes(1)) << 24)
+                            | (ord($this->readBytes(1)) << 16)
+                            | (ord($this->readBytes(1)) << 8)
+                            |  ord($this->readBytes(1));
+                }
             } else {
                 $length = $byte;
             }
 
-            $chunk = "";
-            while (strlen($chunk) < $length) {
-                $chunk .= fread($this->socket, $length - strlen($chunk));
+            $chunk = $length > 0 ? $this->readBytes($length) : '';
+            $responses[] = $chunk;
+
+            if ($this->debug) {
+                $this->debug(">>> $chunk");
             }
 
-            $responses[] = $chunk;
-            $this->debug(">>> $chunk");
+            // Fin de respuesta
+            if ($chunk === '!done') break;
 
-            if ($chunk == "!done") break;
-
+            // Evitar bloqueos prolongados
             $meta = stream_get_meta_data($this->socket);
-            if ($meta['timed_out']) break;
+            if (!empty($meta['timed_out'])) break;
         }
 
         return $parse ? $this->parseResponse($responses) : $responses;
@@ -192,19 +272,26 @@ class RouterosAPI
      */
     public function parseResponse(array $response): array
     {
-        $parsed = [];
+        $parsed  = [];
         $current = null;
 
         foreach ($response as $line) {
+            $first = $line !== '' ? $line[0] : '';
+
             if ($line === '!re') {
                 $parsed[] = [];
-                $current = &$parsed[count($parsed) - 1];
+                $current  = &$parsed[count($parsed) - 1];
             } elseif ($line === '!trap' || $line === '!fatal') {
+                if (!isset($parsed[$line])) $parsed[$line] = [];
                 $parsed[$line][] = [];
                 $current = &$parsed[$line][count($parsed[$line]) - 1];
-            } elseif (strpos($line, '=') === 0) {
-                $parts = explode('=', substr($line, 1), 2);
-                $current[$parts[0]] = $parts[1] ?? '';
+            } elseif ($first === '=' && $current !== null) {
+                $eq = strpos($line, '=', 1);
+                if ($eq === false) {
+                    $current[substr($line, 1)] = '';
+                } else {
+                    $current[substr($line, 1, $eq - 1)] = substr($line, $eq + 1);
+                }
             }
         }
         return $parsed;
@@ -215,18 +302,19 @@ class RouterosAPI
      */
     public function execmd(string $command): array
     {
-        if (!$command) return [];
+        if ($command === '') return [];
 
-        $data = explode(" ", trim($command));
+        $data  = explode(' ', trim($command));
         $count = count($data);
 
         foreach ($data as $i => $com) {
-            $last = ($i === $count - 1);
-            $prefix = "";
+            if ($com === '') continue;
+            $last   = ($i === $count - 1);
+            $prefix = '';
             if ($i > 0) {
-                $first_char = $com[0];
-                if ($first_char !== "~" && $first_char !== "?") {
-                    $prefix = "=";
+                $fc = $com[0];
+                if ($fc !== '~' && $fc !== '?') {
+                    $prefix = '=';
                 }
             }
             $this->write($prefix . $com, $last);
@@ -240,10 +328,11 @@ class RouterosAPI
     public function comm(string $com, array $arr = []): array
     {
         $this->write($com, empty($arr));
-        $i = 0;
+        $i     = 0;
         $count = count($arr);
         foreach ($arr as $k => $v) {
-            $prefix = in_array($k[0], ['?', '~']) ? '' : '=';
+            $first  = $k !== '' ? $k[0] : '';
+            $prefix = ($first === '?' || $first === '~') ? '' : '=';
             $this->write($prefix . $k . '=' . $v, ++$i === $count);
         }
         return $this->read();
@@ -255,3 +344,26 @@ class RouterosAPI
     }
 }
 
+// encrypt decript
+
+function encrypt($string, $key=128) {
+	$result = '';
+	for($i=0, $k= strlen($string); $i<$k; $i++) {
+		$char = substr($string, $i, 1);
+		$keychar = substr($key, ($i % strlen($key))-1, 1);
+		$char = chr(ord($char)+ord($keychar));
+		$result .= $char;
+	}
+	return base64_encode($result);
+}
+function decrypt($string, $key=128) {
+	$result = '';
+	$string = base64_decode($string);
+	for($i=0, $k=strlen($string); $i< $k ; $i++) {
+		$char = substr($string, $i, 1);
+		$keychar = substr($key, ($i % strlen($key))-1, 1);
+		$char = chr(ord($char)-ord($keychar));
+		$result .= $char;
+	}
+	return $result;
+}
