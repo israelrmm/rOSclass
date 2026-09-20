@@ -2,7 +2,7 @@
 A modern, lightweight PHP class optimized for the RouterOS/Mikrotik native API
 
 
-[![PHP 8.2+](https://img.shields.io/badge/PHP-8.2+-777BB4?style=for-the-badge&logo=php&logoColor=white)](https://php.net)
+[![PHP 8.2+](https://img.shields.io/badge/PHP-8.2+-777BB4)](https://php.net)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![MikroTik](https://img.shields.io/badge/MikroTik-RouterOS-orange.svg)](https://mikrotik.com/)
 
