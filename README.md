@@ -9,7 +9,7 @@ A lightweight, fast, and optimized PHP library designed to interact with the **M
 
 ## ✨ Features
 
-* **2026 Optimization:** Refined code for PHP 7.4 and higher (fully compatible with PHP 8.x).
+* **2026 Optimization:** Refined code for PHP 8.2 and higher (fully compatible with PHP 8.x).
 * **Security:** Native support for secure connections via **SSL/TLS**.
 * **Compatibility:** Works with RouterOS v6.43+ (new login method) and legacy versions.
 * **Debugging:** Integrated debug system to monitor API communication directly in the console.
