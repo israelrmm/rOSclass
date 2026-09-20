@@ -1,14 +1,32 @@
 <?php
 /*****************************
- * RouterOS PHP API class ( sep 2026)
- * For php 7.0+
+ * RouterOS PHP API class (sep 2026)
+ *
+ * REQUIERE PHP 8.2 O SUPERIOR
+ *
  * Based in work of https://github.com/BenMenking/routeros-api
  * by Israel Marrero
+ *
+ * Optimizaciones de riesgo bajo aplicadas:
+ *   #1  readBytes() con puntero de offset (evita substr() O(n²))
+ *   #3  parseResponse() sin referencias
+ *   #4  Contexto de stream cacheado + tcp_nodelay vía context
+ *   #5  Sin stream_get_meta_data() en el bucle caliente
+ *   #6  encodeLength() con pack() en lugar de chr() encadenados
+ *   #8  Pipelining: send() / receive()
+ *   #9  Bundle de escrituras en send() → 1 fwrite por comando
+ *   #10 stream_set_chunk_size() + read/write buffer desactivados
+ *   #11 Lectura agrupada de bytes de longitud (2/3/4 en una llamada)
+ *   #12 parseResponse() con explode(..., 2)
+ *
+ * La API pública (connect, disconnect, write, read, comm, execmd,
+ * parseResponse, encodeLength) mantiene firma y comportamiento original.
+ * Métodos nuevos: send() y receive() para pipelining opcional.
  ***********************************************/
 
 class RouterosAPI
 {
-    // Propiedades con tipos definidos (PHP 7.4+)
+    // Propiedades con tipos definidos
     public bool $debug      = false;
     public bool $connected  = false;
     public int  $port       = 8728;
@@ -18,13 +36,19 @@ class RouterosAPI
     public int  $delay      = 2;
 
     /** Tamaño del bloque de lectura del socket (bytes). */
-    public int $readChunkSize = 8192;
+    public int $readChunkSize = 65536;
 
     /** @var resource|null */
     protected $socket;
 
     /** Buffer interno para evitar fread() byte a byte. */
     protected string $readBuffer = '';
+
+    /** Posición de lectura dentro de $readBuffer (evita substr() O(n) por lectura). */
+    protected int $readPos = 0;
+
+    /** @var resource|null Contexto de stream cacheado. */
+    protected $context = null;
 
     public $error_no;
     public $error_str;
@@ -41,55 +65,87 @@ class RouterosAPI
 
     /**
      * Codifica la longitud de la cadena según el protocolo de MikroTik.
+     * Usa pack() en lugar de chr() encadenados (menos llamadas a función,
+     * mismos bytes en el cable).
      */
     public function encodeLength(int $length): string
     {
         if ($length < 0x80) {
             return chr($length);
         } elseif ($length < 0x4000) {
-            return chr(($length >> 8) | 0x80) . chr($length & 0xFF);
+            return pack('n', $length | 0x8000);
         } elseif ($length < 0x200000) {
-            return chr(($length >> 16) | 0xC0) . chr(($length >> 8) & 0xFF) . chr($length & 0xFF);
+            return substr(pack('N', $length | 0xC00000), 1);
         } elseif ($length < 0x10000000) {
-            return chr(($length >> 24) | 0xE0) . chr(($length >> 16) & 0xFF) . chr(($length >> 8) & 0xFF) . chr($length & 0xFF);
+            return pack('N', $length | 0xE0000000);
         }
-        return chr(0xF0) . chr(($length >> 24) & 0xFF) . chr(($length >> 16) & 0xFF) . chr(($length >> 8) & 0xFF) . chr($length & 0xFF);
+        return "\xF0" . pack('N', $length);
     }
 
     /* ---------------------------------------------------------------------
-     *  Buffer de lectura — la gran optimización
+     *  Buffer de lectura con offset
      * ------------------------------------------------------------------- */
 
     /**
      * Devuelve exactamente $n bytes (o menos si el socket cierra/timeout).
-     * Lee del socket en bloques grandes y mantiene un buffer interno.
+     * Lee del socket en bloques grandes y mantiene un buffer interno con
+     * un puntero de posición para evitar copias O(n) en cada lectura.
      */
     protected function readBytes(int $n): string
     {
         if ($n <= 0) return '';
 
-        $buffered = strlen($this->readBuffer);
-        while ($buffered < $n) {
-            $need  = $n - $buffered;
+        $available = strlen($this->readBuffer) - $this->readPos;
+
+        while ($available < $n) {
+            $need  = $n - $available;
             $chunk = fread($this->socket, max($this->readChunkSize, $need));
             if ($chunk === false || $chunk === '') {
                 break; // timeout o desconexión
             }
             $this->readBuffer .= $chunk;
-            $buffered += strlen($chunk);
+            $available += strlen($chunk);
         }
 
-        if ($buffered === 0) return '';
+        if ($available === 0) return '';
 
-        if ($buffered <= $n) {
-            $data = $this->readBuffer;
-            $this->readBuffer = '';
-            return $data;
+        $take = $available < $n ? $available : $n;
+        $data = substr($this->readBuffer, $this->readPos, $take);
+        $this->readPos += $take;
+
+        // Compactar el buffer sólo cuando ya hemos consumido bastante
+        // o cuando lo hemos vaciado por completo.
+        if ($this->readPos >= 65536 || $this->readPos >= strlen($this->readBuffer)) {
+            $this->readBuffer = substr($this->readBuffer, $this->readPos);
+            $this->readPos    = 0;
         }
 
-        $data = substr($this->readBuffer, 0, $n);
-        $this->readBuffer = substr($this->readBuffer, $n);
         return $data;
+    }
+
+    /* ---------------------------------------------------------------------
+     *  Contexto de stream cacheado
+     * ------------------------------------------------------------------- */
+
+    /**
+     * Devuelve (y cachea) el contexto de stream usado para la conexión.
+     * 'socket' => ['tcp_nodelay' => true] está disponible desde PHP 7.1.
+     */
+    protected function getContext()
+    {
+        if ($this->context === null) {
+            $this->context = stream_context_create([
+                'socket' => [
+                    'tcp_nodelay' => true,
+                ],
+                'ssl' => [
+                    'verify_peer'       => false,
+                    'verify_peer_name'  => false,
+                    'allow_self_signed' => true,
+                ],
+            ]);
+        }
+        return $this->context;
     }
 
     /* ---------------------------------------------------------------------
@@ -100,16 +156,9 @@ class RouterosAPI
         for ($a = 1; $a <= $this->attempts; $a++) {
             $this->connected  = false;
             $this->readBuffer = '';
+            $this->readPos    = 0;
 
             $protocol = ($this->ssl ? 'ssl://' : 'tcp://');
-
-            $context = stream_context_create([
-                'ssl' => [
-                    'verify_peer'       => false,
-                    'verify_peer_name'  => false,
-                    'allow_self_signed' => true,
-                ],
-            ]);
 
             $this->socket = @stream_socket_client(
                 $protocol . $ip . ':' . $this->port,
@@ -117,21 +166,16 @@ class RouterosAPI
                 $this->error_str,
                 $this->timeout,
                 STREAM_CLIENT_CONNECT,
-                $context
+                $this->getContext()
             );
 
             if (is_resource($this->socket)) {
                 stream_set_timeout($this->socket, $this->timeout);
 
-                // Desactivar Nagle (TCP_NODELAY): elimina el retardo de ~40 ms
-                // por comando. Es opcional: si la extensión sockets no existe
-                // simplemente se ignora.
-                if (function_exists('socket_import_stream')) {
-                    $sock = @socket_import_stream($this->socket);
-                    if ($sock !== false && defined('TCP_NODELAY')) {
-                        @socket_set_option($sock, SOL_TCP, TCP_NODELAY, 1);
-                    }
-                }
+                // Permitir reads grandes y desactivar el buffering interno de PHP.
+                stream_set_chunk_size($this->socket, $this->readChunkSize);
+                stream_set_read_buffer($this->socket, 0);
+                stream_set_write_buffer($this->socket, 0);
 
                 if ($this->loginProcess($login, $password)) {
                     $this->connected = true;
@@ -184,15 +228,19 @@ class RouterosAPI
         }
         $this->connected  = false;
         $this->readBuffer = '';
+        $this->readPos    = 0;
     }
 
     /* ---------------------------------------------------------------------
-     *  Escritura
+     *  Escritura (API pública legacy)
      * ------------------------------------------------------------------- */
 
     /**
      * Escribe longitud + palabra (+ terminador si $terminal).
      * Se hace todo en un solo fwrite → 1 syscall en lugar de 2.
+     *
+     * Se mantiene por compatibilidad con código existente y porque
+     * loginProcess() lo usa. Para envíos batcheados usar send().
      */
     public function write(string $command, bool $terminal = true): bool
     {
@@ -226,24 +274,27 @@ class RouterosAPI
 
             $byte = ord($byteStr);
 
-            // Decodificar longitud (protocolo MikroTik)
+            // Decodificar longitud (protocolo MikroTik).
+            // Los bytes de longitud se leen agrupados para reducir
+            // llamadas a readBytes() por palabra.
             if ($byte & 128) {
                 if (($byte & 192) === 128) {
                     $length = (($byte & 63) << 8) | ord($this->readBytes(1));
                 } elseif (($byte & 224) === 192) {
-                    $length = (($byte & 31) << 16)
-                            | (ord($this->readBytes(1)) << 8)
-                            |  ord($this->readBytes(1));
+                    $b = $this->readBytes(2);
+                    $length = (($byte & 31) << 16) | (ord($b[0]) << 8) | ord($b[1]);
                 } elseif (($byte & 240) === 224) {
+                    $b = $this->readBytes(3);
                     $length = (($byte & 15) << 24)
-                            | (ord($this->readBytes(1)) << 16)
-                            | (ord($this->readBytes(1)) << 8)
-                            |  ord($this->readBytes(1));
+                            | (ord($b[0]) << 16)
+                            | (ord($b[1]) << 8)
+                            |  ord($b[2]);
                 } else {
-                    $length = (ord($this->readBytes(1)) << 24)
-                            | (ord($this->readBytes(1)) << 16)
-                            | (ord($this->readBytes(1)) << 8)
-                            |  ord($this->readBytes(1));
+                    $b = $this->readBytes(4);
+                    $length = (ord($b[0]) << 24)
+                            | (ord($b[1]) << 16)
+                            | (ord($b[2]) << 8)
+                            |  ord($b[3]);
                 }
             } else {
                 $length = $byte;
@@ -259,9 +310,9 @@ class RouterosAPI
             // Fin de respuesta
             if ($chunk === '!done') break;
 
-            // Evitar bloqueos prolongados
-            $meta = stream_get_meta_data($this->socket);
-            if (!empty($meta['timed_out'])) break;
+            // Nota: si el socket hace timeout, readBytes() devuelve '' y
+            // la siguiente iteración rompe el bucle por la misma vía.
+            // No es necesario consultar stream_get_meta_data() aquí.
         }
 
         return $parse ? $this->parseResponse($responses) : $responses;
@@ -269,28 +320,36 @@ class RouterosAPI
 
     /**
      * Convierte la respuesta plana en un array asociativo.
+     * Sin referencias: menos refcounts y copias en respuestas grandes.
      */
     public function parseResponse(array $response): array
     {
-        $parsed  = [];
-        $current = null;
+        $parsed = [];
+        $kind   = null;   // 'list' | '!trap' | '!fatal'
+        $idx    = -1;
 
         foreach ($response as $line) {
-            $first = $line !== '' ? $line[0] : '';
+            if ($line === '') continue;
 
             if ($line === '!re') {
                 $parsed[] = [];
-                $current  = &$parsed[count($parsed) - 1];
+                $kind = 'list';
+                $idx  = count($parsed) - 1;
             } elseif ($line === '!trap' || $line === '!fatal') {
-                if (!isset($parsed[$line])) $parsed[$line] = [];
+                if (!isset($parsed[$line])) {
+                    $parsed[$line] = [];
+                }
                 $parsed[$line][] = [];
-                $current = &$parsed[$line][count($parsed[$line]) - 1];
-            } elseif ($first === '=' && $current !== null) {
-                $eq = strpos($line, '=', 1);
-                if ($eq === false) {
-                    $current[substr($line, 1)] = '';
+                $kind = $line;
+                $idx  = count($parsed[$line]) - 1;
+            } elseif ($line[0] === '=' && $idx >= 0) {
+                $parts = explode('=', substr($line, 1), 2);
+                $k = $parts[0];
+                $v = $parts[1] ?? '';
+                if ($kind === 'list') {
+                    $parsed[$idx][$k] = $v;
                 } else {
-                    $current[substr($line, 1, $eq - 1)] = substr($line, $eq + 1);
+                    $parsed[$kind][$idx][$k] = $v;
                 }
             }
         }
@@ -322,20 +381,63 @@ class RouterosAPI
         return $this->read();
     }
 
+    /* ---------------------------------------------------------------------
+     *  Envío / recepción separados (pipelining)
+     * ------------------------------------------------------------------- */
+
+    /**
+     * Envía un comando SIN leer la respuesta.
+     *
+     * Todas las escrituras (comando + parámetros + terminador) se agrupan
+     * en un único fwrite → 1 syscall por comando completo, sin importar
+     * cuántos parámetros tenga.
+     *
+     * Combínalo con receive() para hacer pipelining de varios comandos
+     * y ahorrar round-trips.
+     */
+    public function send(string $com, array $arr = []): void
+    {
+        if (!is_resource($this->socket)) return;
+
+        $com = trim($com);
+        $buf = $this->encodeLength(strlen($com)) . $com;
+
+        if (empty($arr)) {
+            $buf .= "\0";
+        } else {
+            $count = count($arr);
+            $i     = 0;
+            foreach ($arr as $k => $v) {
+                $first  = $k !== '' ? $k[0] : '';
+                $prefix = ($first === '?' || $first === '~') ? '' : '=';
+                $line   = trim($prefix . $k . '=' . $v);
+                $buf   .= $this->encodeLength(strlen($line)) . $line;
+                if (++$i === $count) {
+                    $buf .= "\0";
+                }
+            }
+        }
+
+        fwrite($this->socket, $buf);
+        $this->debug("<<< $com");
+    }
+
+    /**
+     * Lee la siguiente respuesta pendiente enviada con send().
+     */
+    public function receive(): array
+    {
+        return $this->read();
+    }
+
     /**
      * Método preferido para enviar comandos con arrays de parámetros.
+     * Se compone de send() + receive().
      */
     public function comm(string $com, array $arr = []): array
     {
-        $this->write($com, empty($arr));
-        $i     = 0;
-        $count = count($arr);
-        foreach ($arr as $k => $v) {
-            $first  = $k !== '' ? $k[0] : '';
-            $prefix = ($first === '?' || $first === '~') ? '' : '=';
-            $this->write($prefix . $k . '=' . $v, ++$i === $count);
-        }
-        return $this->read();
+        $this->send($com, $arr);
+        return $this->receive();
     }
 
     public function __destruct()
@@ -343,4 +445,3 @@ class RouterosAPI
         $this->disconnect();
     }
 }
-
